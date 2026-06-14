@@ -1,0 +1,30 @@
+# RL
+stable-baselines3==2.3.2
+gymnasium==0.29.1
+
+# Vision
+torch>=2.9.0
+torchvision>=0.24.0
+git+https://github.com/openai/CLIP.git
+Pillow>=10.3.0
+
+# Simulation
+minigrid==2.3.1
+
+# Language
+google-generativeai==0.5.4
+
+# API
+fastapi>=0.111.0
+uvicorn>=0.29.0
+pydantic>=2.7.1
+python-dotenv>=1.0.1
+
+# Dashboard
+streamlit>=1.35.0
+requests>=2.32.2
+
+# Testing
+hypothesis
+pytest
+pytest-asyncio

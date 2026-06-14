@@ -1,0 +1,39 @@
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Model weights
+*.pth
+*.zip
+models/*.zip
+models/*.pth
+
+# Environment secrets
+.env
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Test and coverage
+.pytest_cache/
+.coverage
+htmlcov/
