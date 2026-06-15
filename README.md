@@ -125,13 +125,58 @@ The backend will log every missing variable and exit with a non-zero status code
 
 ---
 
+## Results
+
+Trained with PPO for 500k timesteps on the MVP environment (single 10×10 room, 5 objects):
+
+| Metric | Value |
+|---|---|
+| Success rate | ~75–80% |
+| Mean steps to goal (successful runs) | ~20 |
+| Mean episode length | ~23 steps |
+
+The policy receives a compact observation — the normalized direction to the
+target plus local wall sensors — and learns to turn toward the goal and
+advance while avoiding walls. Most failures occur when a wall sits directly
+between the agent and the target and the agent does not route around it in
+time.
+
+Reproduce the numbers with:
+
+```bash
+python scripts/evaluate.py --model-path models/policy.zip --episodes 50
+```
+
+---
+
+## Usage
+
+Once the backend and dashboard are running, type an instruction such as:
+
+- `go to the red chair`
+- `navigate to the blue box`
+- `find the lamp`
+
+Object types: `chair`, `table`, `lamp`, `door`, `box`.
+Colors: `red`, `green`, `blue`, `purple`, `yellow`, `grey`.
+
+Click **Start Session**, then **Step** to advance one action at a time or
+**Run to Completion** to let the agent run until it reaches the target or
+exhausts its step budget. The dashboard shows the agent's point-of-view, a
+per-step log, and live evaluation metrics.
+
+If the Gemini API is unavailable (e.g. rate limited), the backend falls back
+to a built-in keyword parser, so instructions still resolve.
+
+---
+
 ## Known Limitations
 
 - Single-room environment only — no multi-room navigation.
 - Exactly 5 objects per episode.
 - Single-step instructions only — sequences like "go to the lamp, then the chair" are not supported.
 - No persistent memory between sessions — the agent has no recollection of prior episodes.
-- CLIP inference runs on CPU — expect roughly 100–300 ms per step depending on hardware.
+- The policy succeeds ~75–80% of the time; the main failure mode is getting stuck against a wall that lies directly between the agent and the target.
 - The policy is untrained out of the box; run `train.py` before using the backend or the agent will behave randomly.
 - Session state is in-memory only — restarting the backend clears all active sessions.
 
