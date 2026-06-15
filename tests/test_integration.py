@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import gymnasium as gym
 
-from agent.policy import build_obs_space, load_policy, make_policy, predict_action
+from agent.policy import OBS_DIM, build_obs_space, load_policy, make_policy, predict_action
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +99,7 @@ def test_policy_save_load_cycle(tmp_path):
 
     rng = np.random.default_rng(42)
     for _ in range(50):
-        obs = rng.uniform(-1, 1, size=(576,)).astype(np.float32)
+        obs = rng.uniform(-1, 1, size=(OBS_DIM,)).astype(np.float32)
         original = predict_action(policy, obs)
         loaded_action = predict_action(loaded, obs)
         assert original == loaded_action, f"Action mismatch: {original} != {loaded_action}"

@@ -79,7 +79,7 @@ class _NavigationEnv(MiniGridEnv):
         super().__init__(
             mission_space=mission_space,
             grid_size=grid_size,
-            max_steps=10_000,       # high cap; episode end is handled externally
+            max_steps=200,          # matches step_budget — agent trained on 200-step episodes
             see_through_walls=False,
             render_mode=None,
         )

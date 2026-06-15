@@ -152,7 +152,7 @@ with left:
         img_bytes = base64.b64decode(st.session_state.pov_frame_b64)
         img = Image.open(io.BytesIO(img_bytes))
         big = _upscale(img)
-        st.image(big, use_container_width=True)
+        st.image(big, use_container_width=False)
         st.caption(
             f"Resolution: {img.width}×{img.height}px (MiniGrid partial view) "
             f"— displayed at {_DISPLAY_SIZE}×{_DISPLAY_SIZE}px"
@@ -220,4 +220,4 @@ with right:
         st.subheader("Step Log")
         df = pd.DataFrame(st.session_state.step_log)
         df.columns = [c.replace("_", " ").title() for c in df.columns]
-        st.dataframe(df, use_container_width=True, height=250)
+        st.dataframe(df, use_container_width=False, height=250)

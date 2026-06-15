@@ -1,67 +1,63 @@
-import hashlib
-
 import numpy as np
 import gymnasium as gym
 import yaml
-from gymnasium import ObservationWrapper
 from stable_baselines3 import PPO
 
-GOAL_ENCODING_DIM = 64
-OBS_DIM = 512 + GOAL_ENCODING_DIM  # 576
+# Low-dimensional observation for fast, reliable navigation learning.
+# Layout (7 floats):
+#   [0] delta_row to target (normalized by grid size)
+#   [1] delta_col to target (normalized by grid size)
+#   [2] agent direction sin
+#   [3] agent direction cos
+#   [4] wall directly ahead   (0 or 1)
+#   [5] wall to the left      (0 or 1)
+#   [6] wall to the right     (0 or 1)
+OBS_DIM = 7
 
-# Default dummy goal used during training (no instruction available)
-_DUMMY_GOAL = {"target": None, "attribute": None, "context": None, "error": None}
+# MiniGrid direction → (dcol, drow) forward / left / right cell offsets
+# dir: 0=right(+col), 1=down(+row), 2=left(-col), 3=up(-row)
+_FORWARD = {0: (1, 0), 1: (0, 1), 2: (-1, 0), 3: (0, -1)}
+_LEFT = {0: (0, -1), 1: (1, 0), 2: (0, 1), 3: (-1, 0)}
+_RIGHT = {0: (0, 1), 1: (-1, 0), 2: (0, -1), 3: (1, 0)}
 
 
 def build_obs_space() -> gym.spaces.Box:
-    return gym.spaces.Box(low=-np.inf, high=np.inf, shape=(OBS_DIM,), dtype=np.float32)
+    return gym.spaces.Box(low=-1.0, high=1.0, shape=(OBS_DIM,), dtype=np.float32)
 
 
-def _field_vector(value: str | None) -> np.ndarray:
-    # use md5 for a stable, cross-process hash — Python's built-in hash() is not stable
-    text = value if value is not None else "null"
-    digest = hashlib.md5(text.encode()).digest()
-    seed = int.from_bytes(digest[:4], "little") % (2**31)
-    return np.random.default_rng(seed).random(16).astype(np.float32)
+def _is_wall(base_env, col: int, row: int) -> float:
+    """1.0 if the cell at (col,row) is a wall or out of bounds, else 0.0."""
+    if col < 0 or row < 0 or col >= base_env.grid.width or row >= base_env.grid.height:
+        return 1.0
+    cell = base_env.grid.get(col, row)
+    if cell is not None and getattr(cell, "type", None) == "wall":
+        return 1.0
+    return 0.0
 
 
-def encode_goal(goal: dict) -> np.ndarray:
-    parts = [
-        _field_vector(goal.get("target")),
-        _field_vector(goal.get("attribute")),
-        _field_vector(goal.get("context")),
-        _field_vector(goal.get("error")),
-    ]
-    return np.concatenate(parts)  # (64,)
+def detect_walls(base_env):
+    """Returns (ahead, left, right) wall flags relative to agent facing."""
+    col, row = int(base_env.agent_pos[0]), int(base_env.agent_pos[1])
+    d = int(base_env.agent_dir)
+    fa = _FORWARD[d]
+    le = _LEFT[d]
+    ri = _RIGHT[d]
+    return (
+        _is_wall(base_env, col + fa[0], row + fa[1]),
+        _is_wall(base_env, col + le[0], row + le[1]),
+        _is_wall(base_env, col + ri[0], row + ri[1]),
+    )
 
 
-def make_observation(frame_embedding: np.ndarray, goal: dict) -> np.ndarray:
-    # layout: [0:512] frame, [512:576] goal encoding — matches design doc observation spec
-    return np.concatenate([frame_embedding, encode_goal(goal)])  # (576,)
-
-
-class FlatObsWrapper(ObservationWrapper):
-    """Converts a MiniGrid Dict obs to a flat (576,) float32 vector for SB3.
-
-    Uses real CLIP embeddings so the policy trains on the same observation
-    space it will see at inference time via the backend.
-    """
-
-    def __init__(self, env):
-        super().__init__(env)
-        self.observation_space = build_obs_space()
-        # Import vision here to avoid loading CLIP unless this wrapper is used
-        from agent.vision import encode_frame as _encode
-        self._encode = _encode
-
-    def observation(self, obs):
-        frame_emb = self._encode(obs["image"])  # float32 (512,), L2-normalized
-        return make_observation(frame_emb, _DUMMY_GOAL)  # (576,)
-
-
-def wrap_for_training(env) -> gym.Env:
-    """Wrap a MiniGrid env so it has the flat (576,) obs space SB3 expects."""
-    return FlatObsWrapper(env)
+def build_nav_obs(agent_rc, agent_dir, target_rc, grid_size, walls) -> np.ndarray:
+    """Build the 7-dim observation. agent_rc/target_rc are (row, col)."""
+    dr = (target_rc[0] - agent_rc[0]) / max(grid_size, 1)
+    dc = (target_rc[1] - agent_rc[1]) / max(grid_size, 1)
+    angle = agent_dir * (np.pi / 2.0)
+    return np.array(
+        [dr, dc, np.sin(angle), np.cos(angle), walls[0], walls[1], walls[2]],
+        dtype=np.float32,
+    )
 
 
 def make_policy(env) -> PPO:

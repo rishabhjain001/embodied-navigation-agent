@@ -38,6 +38,7 @@ class Session:
     target_pos: tuple[int, int]
     collision_count: int
     last_obs_image: Any = None    # most recent obs["image"] for CLIP encoding
+    _counted: bool = False        # whether this session was added to experiment stats
 
 
 _sessions: dict[str, Session] = {}
@@ -77,13 +78,13 @@ def get_session(session_id: str) -> Session | None:
 
 
 def update_session(session: Session) -> None:
-    previous = _sessions.get(session.session_id)
-    # Only count stats when a session first reaches a terminal state
-    if previous is not None and previous.status == "active":
-        if session.status in ("success", "failure"):
-            _experiment_stats["total"] += 1
-            if session.status == "success":
-                _experiment_stats["successes"] += 1
+    # Count terminal sessions once. The session is stored by reference, so we
+    # use a flag rather than comparing previous status (which is already mutated).
+    if not session._counted and session.status in ("success", "failure"):
+        _experiment_stats["total"] += 1
+        if session.status == "success":
+            _experiment_stats["successes"] += 1
+        session._counted = True
     _sessions[session.session_id] = session
 
 

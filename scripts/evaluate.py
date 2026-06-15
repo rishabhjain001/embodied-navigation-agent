@@ -10,10 +10,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from agent.env import make_env
-from agent.policy import load_policy, predict_action, make_observation
-from agent.vision import encode_frame
-from train import load_config
+from agent.policy import load_policy, predict_action
+from train import load_config, NavTrainEnv
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -27,50 +25,37 @@ def parse_args():
     return parser.parse_args()
 
 
-# dummy goal used when no instruction is available in standalone eval
-_DUMMY_GOAL = {"target": None, "attribute": None, "context": None, "error": None}
-
-
-def run_episode_tracked(env, policy, step_budget: int, seed: int | None) -> dict:
-    """Run one episode and return per-episode metrics."""
+def run_episode(env, policy, step_budget: int, seed: int | None) -> dict:
     obs, _ = env.reset(seed=seed)
-    frame = obs["image"]
-
     steps = 0
     forward_moves = 0
-    done = False
-    info = {}
-
-    while not done and steps < step_budget:
-        embedding = encode_frame(frame)
-        observation = make_observation(embedding, _DUMMY_GOAL)
-        action = predict_action(policy, observation)
-
-        obs, _reward, terminated, truncated, info = env.step(action)
-        frame = obs["image"]
-        steps += 1
-
-        if action == 0:
-            forward_moves += 1
-
-        if action == 3 or terminated or truncated:
-            done = True
-
-    collisions = info.get("collision_count", 0)
-    # path_length counts all forward-move actions (including blocked ones mirrors
-    # what the API session tracker does: every move_forward issued = one step along path)
-    path_length = forward_moves
-
-    # no real target in standalone eval; success is always False
+    collisions = 0
     success = False
 
-    # navigation efficiency is undefined without a real target
-    efficiency = 0.0
+    while steps < step_budget:
+        action = predict_action(policy, obs)
+        prev_rc = env._agent_rc()
+        obs, reward, terminated, truncated, _ = env.step(action)
+        steps += 1
+        if action == 0:
+            forward_moves += 1
+            if env._agent_rc() == prev_rc:
+                collisions += 1
+        if terminated:
+            # terminated (not truncated) means success in NavTrainEnv
+            success = reward > 0
+            break
+        if truncated:
+            break
+
+    start = env._env.agent_pos
+    dist = abs(env._target[0] - start[1]) + abs(env._target[1] - start[0])
+    efficiency = (dist / forward_moves) if (success and forward_moves > 0 and dist > 0) else (1.0 if success else 0.0)
 
     return {
         "success": success,
         "steps": steps,
-        "path_length": path_length,
+        "path_length": forward_moves,
         "collisions": collisions,
         "efficiency": efficiency,
     }
@@ -114,11 +99,14 @@ def main():
         sys.exit(1)
 
     step_budget = cfg.get("step_budget", 200)
-    grid_size = cfg.get("grid_size", 10)
-    object_count = cfg.get("object_count", 5)
 
     try:
-        env = make_env(grid_size=grid_size, object_count=object_count)
+        env = NavTrainEnv(
+            grid_size=cfg["grid_size"],
+            object_count=cfg["object_count"],
+            step_budget=step_budget,
+            cfg=cfg,
+        )
     except Exception as exc:
         logging.error(f"failed to initialize environment: {exc}")
         sys.exit(1)
@@ -134,8 +122,7 @@ def main():
     results = []
     for i in range(args.episodes):
         episode_seed = (args.seed + i) if args.seed is not None else None
-        result = run_episode_tracked(env, policy, step_budget, episode_seed)
-        results.append(result)
+        results.append(run_episode(env, policy, step_budget, episode_seed))
 
     print_table(results)
 

@@ -1,3 +1,14 @@
+# Kiro IDE internals
+.kiro/
+
+# Colab training notebook
+train_colab.ipynb
+colab_train.py
+
+# Pytest and hypothesis cache
+.pytest_cache/
+.hypothesis/
+
 # Python artifacts
 __pycache__/
 *.pyc

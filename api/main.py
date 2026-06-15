@@ -16,8 +16,8 @@ from PIL import Image as PILImage
 import gymnasium as gym
 
 from agent.env import make_env, get_object_positions
-from agent.language import parse_instruction
-from agent.policy import load_policy, build_obs_space, predict_action, make_observation
+from agent.language import parse_instruction, keyword_parse
+from agent.policy import load_policy, build_obs_space, predict_action, build_nav_obs, detect_walls
 from agent.reward import compute_reward, manhattan_distance
 from agent.vision import encode_frame
 from api.models import (
@@ -182,18 +182,16 @@ def _step_log_model(session: Session) -> list[StepRecordModel]:
 
 
 def _execute_step(session: Session, step_budget: int) -> bool:
-    """Run one step on the session in-place. Returns done flag.
-
-    Mutates session.step_count, step_log, metrics, status, failure_reason,
-    collision_count, and last_obs_image. Caller must call update_session().
-    """
+    """Run one step on the session in-place. Returns done flag."""
     base_env = _unwrap_base_env(session.env)
     prev_pos = (int(base_env.agent_pos[1]), int(base_env.agent_pos[0]))  # (row, col)
 
-    # Use the frame stored from the previous step/reset for CLIP encoding
-    obs_image: np.ndarray = session.last_obs_image
-    frame_embedding = encode_frame(obs_image)
-    obs_vector = make_observation(frame_embedding, session.goal)
+    # Build the same 7-dim navigation obs used during training
+    walls = detect_walls(base_env)
+    obs_vector = build_nav_obs(
+        prev_pos, int(base_env.agent_dir),
+        session.target_pos, base_env.width, walls,
+    )
     action = predict_action(session.policy, obs_vector)
 
     next_obs, _, terminated, truncated, info = session.env.step(action)
@@ -223,16 +221,17 @@ def _execute_step(session: Session, step_budget: int) -> bool:
     if action == 0:  # move_forward
         session.metrics.path_length += 1
 
-    # collision_count in info is cumulative from the env; store it directly
     session.collision_count = info.get("collision_count", 0)
     session.metrics.collision_count = session.collision_count
-
     session.last_obs_image = next_obs["image"]
 
-    if done:
+    # success when agent reaches within 1 cell (matches training auto-success)
+    # or explicitly stops near the target
+    reached = manhattan_distance(curr_pos, session.target_pos) <= 1
+    if reached or action == 3 or session.step_count >= step_budget:
+        done = True
         session.metrics.steps_to_goal = session.step_count
-
-        if action == 3 and manhattan_distance(curr_pos, session.target_pos) <= 1:
+        if reached:
             session.status = "success"
         elif session.step_count >= step_budget:
             session.status = "failure"
@@ -247,8 +246,6 @@ def _execute_step(session: Session, step_budget: int) -> bool:
             session.metrics.navigation_efficiency = (
                 dist / pl if pl > 0 and dist > 0 else 1.0
             )
-
-        session.metrics.success_rate = get_success_rate()
 
     return done
 
@@ -267,13 +264,32 @@ async def start_session(request: StartSessionRequest):
         obs, _ = env.reset()
 
         goal = parse_instruction(request.instruction, env.object_types)
+        # if the LLM is unavailable (rate limit, timeout, etc.), fall back to
+        # a simple keyword parser so the agent stays usable
+        if goal.get("error") is not None:
+            goal = keyword_parse(request.instruction, env.object_types)
 
         positions = get_object_positions(env)
-        target_key = next(
-            (k for k in positions if k.startswith(goal.get("target") or "")),
-            None,
-        )
-        target_pos = positions.get(target_key, (0, 0)) if target_key else (0, 0)
+        # match on type and color when available: keys are "{type}_{color}"
+        tgt = goal.get("target") or ""
+        attr = goal.get("attribute") or ""
+        target_key = None
+        if tgt and attr:
+            # prefer exact type+color match
+            target_key = next(
+                (k for k in positions if k == f"{tgt}_{attr}"),
+                None,
+            )
+        if target_key is None and tgt:
+            # fall back to type-only match
+            target_key = next(
+                (k for k in positions if k.startswith(tgt)),
+                None,
+            )
+        if target_key is None and positions:
+            # last resort: pick the first object so the agent still has a goal
+            target_key = next(iter(positions))
+        target_pos = positions.get(target_key, (1, 1)) if target_key else (1, 1)
 
         session = create_session(request.instruction, goal, env, _policy)
 
@@ -311,6 +327,8 @@ async def step_session(session_id: str):
 
     done = _execute_step(session, _config["step_budget"])
     update_session(session)
+    # success_rate reflects aggregate stats after this session is counted
+    session.metrics.success_rate = get_success_rate()
 
     return StepResponse(
         step=session.step_count,
@@ -377,8 +395,10 @@ async def run_session(session_id: str):
         session.status = "failure"
         session.failure_reason = "timeout"
         session.metrics.steps_to_goal = session.step_count
-        session.metrics.success_rate = get_success_rate()
         update_session(session)
+
+    # success_rate reflects aggregate stats after this session is counted
+    session.metrics.success_rate = get_success_rate()
 
     if run_error:
         logging.error(f"run_session failed: {run_error[0]}")

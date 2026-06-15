@@ -1,14 +1,17 @@
 import argparse
 import logging
+import math
 import os
 import sys
 
+import numpy as np
+import gymnasium as gym
 import yaml
 from dotenv import load_dotenv
 from stable_baselines3.common.callbacks import BaseCallback
 
-from agent.env import make_env
-from agent.policy import make_policy, load_policy, wrap_for_training
+from agent.env import _NavigationEnv, get_object_positions
+from agent.policy import make_policy, load_policy, build_obs_space, build_nav_obs, detect_walls
 
 
 def load_config(config_path: str) -> dict:
@@ -20,12 +23,10 @@ def load_config(config_path: str) -> dict:
     result.update(cfg.get("env", {}))
     result.update(cfg.get("reward", {}))
 
-    # env vars take precedence over YAML values
     overrides = {
         "grid_size": os.getenv("GRID_SIZE"),
         "step_budget": os.getenv("STEP_BUDGET"),
         "object_count": os.getenv("OBJECT_COUNT"),
-        "learning_rate": os.getenv("LEARNING_RATE"),
         "total_timesteps": os.getenv("TOTAL_TIMESTEPS"),
     }
     for key, val in overrides.items():
@@ -34,55 +35,123 @@ def load_config(config_path: str) -> dict:
                 result[key] = int(val)
             else:
                 result[key] = float(val)
-
     return result
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train the navigation policy")
-    parser.add_argument("--config", default="configs/default.yaml", help="Path to YAML config")
-    parser.add_argument("--model-path", default=None, help="Path to save/load model weights")
-    parser.add_argument("--force-retrain", action="store_true", help="Ignore existing model, train from scratch")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description="Train the navigation policy")
+    p.add_argument("--config", default="configs/default.yaml")
+    p.add_argument("--model-path", default=None)
+    p.add_argument("--force-retrain", action="store_true")
+    return p.parse_args()
+
+
+class NavTrainEnv(gym.Env):
+    """Single clean training env: 7-dim obs + shaped reward, no tangled wrappers.
+
+    Wraps a raw _NavigationEnv. Picks a random target object each episode and
+    rewards the agent for navigating toward it.
+    """
+
+    def __init__(self, grid_size: int, object_count: int, step_budget: int, cfg: dict):
+        super().__init__()
+        self._env = _NavigationEnv(grid_size=grid_size, object_count=object_count, seed=None)
+        self._grid_size = grid_size
+        self._budget = step_budget
+        self._cfg = cfg
+        self.observation_space = build_obs_space()
+        self.action_space = gym.spaces.Discrete(4)
+        self._target = None
+        self._prev_dist = None
+        self._steps = 0
+
+    def _agent_rc(self):
+        return (int(self._env.agent_pos[1]), int(self._env.agent_pos[0]))
+
+    def _obs(self):
+        walls = detect_walls(self._env)
+        return build_nav_obs(self._agent_rc(), int(self._env.agent_dir),
+                             self._target, self._grid_size, walls)
+
+    def reset(self, *, seed=None, options=None):
+        self._env.reset(seed=seed)
+        self._steps = 0
+        positions = get_object_positions(self._env)
+        if positions:
+            keys = list(positions.keys())
+            idx = self._env.np_random.integers(0, len(keys))
+            self._target = positions[keys[idx]]
+        else:
+            self._target = (1, 1)
+        self._prev_dist = math.dist(self._agent_rc(), self._target)
+        return self._obs(), {}
+
+    def step(self, action):
+        action = int(action)
+        prev_rc = self._agent_rc()
+        self._env.step(action)
+        self._steps += 1
+        curr_rc = self._agent_rc()
+        curr_dist = math.dist(curr_rc, self._target)
+        man = abs(curr_rc[0] - self._target[0]) + abs(curr_rc[1] - self._target[1])
+
+        # dense shaping: reward reduction in distance, small time penalty so
+        # spinning/standing still is actively punished (drives forward motion)
+        reward = (self._prev_dist - curr_dist) - 0.05
+        terminated = False
+
+        if action == 0 and curr_rc == prev_rc:  # blocked forward = collision
+            reward += self._cfg.get("collision", -0.5)
+
+        if action == 3:  # stop
+            if man <= 1:
+                reward += self._cfg.get("success", 10.0)
+            else:
+                reward += -2.0  # penalize stopping in the wrong place
+            terminated = True
+
+        # auto-success: reaching the target cell ends the episode positively
+        # (the policy still learns to stop, but this gives a denser success signal)
+        if man <= 1 and not terminated:
+            reward += self._cfg.get("success", 10.0)
+            terminated = True
+
+        truncated = False
+        if self._steps >= self._budget:
+            reward += self._cfg.get("timeout", -5.0)
+            truncated = True
+
+        self._prev_dist = curr_dist
+        return self._obs(), reward, terminated, truncated, {}
 
 
 class LoggingCallback(BaseCallback):
-    """Tracks per-episode metrics; call get_final_stats() after training."""
-
     def __init__(self, verbose=0):
         super().__init__(verbose)
-        self._episode_rewards: list[float] = []
-        self._episode_lengths: list[int] = []
-        self._episode_successes: list[bool] = []
-        self._current_episode_reward = 0.0
-        self._current_episode_length = 0
+        self._rew, self._lens, self._succ = [], [], []
+        self._cr, self._cl = 0.0, 0
 
     def _on_step(self) -> bool:
-        rewards = self.locals.get("rewards", [0])
-        dones = self.locals.get("dones", [False])
-
-        self._current_episode_reward += float(rewards[0])
-        self._current_episode_length += 1
-
-        if dones[0]:
-            self._episode_rewards.append(self._current_episode_reward)
-            self._episode_lengths.append(self._current_episode_length)
-            # success terminal reward is +10.0; any episode reaching that threshold counts
-            self._episode_successes.append(self._current_episode_reward >= 10.0)
-            self._current_episode_reward = 0.0
-            self._current_episode_length = 0
-
+        r = self.locals.get("rewards", [0])
+        d = self.locals.get("dones", [False])
+        self._cr += float(r[0])
+        self._cl += 1
+        if d[0]:
+            self._rew.append(self._cr)
+            self._lens.append(self._cl)
+            self._succ.append(self._cr >= 9.0)  # success terminal reward is +10
+            self._cr, self._cl = 0.0, 0
         return True
 
     def get_final_stats(self) -> dict:
-        last = self._episode_rewards[-100:]
-        last_lens = self._episode_lengths[-100:]
-        last_success = self._episode_successes[-100:]
+        lr = self._rew[-100:] or [0]
+        ll = self._lens[-100:] or [0]
+        ls = self._succ[-100:] or [False]
         return {
-            "mean_reward": sum(last) / len(last) if last else 0.0,
-            "mean_episode_length": sum(last_lens) / len(last_lens) if last_lens else 0.0,
-            "success_rate": sum(last_success) / len(last_success) if last_success else 0.0,
-            "total_episodes": len(self._episode_rewards),
+            "mean_reward": sum(lr) / len(lr),
+            "mean_episode_length": sum(ll) / len(ll),
+            "success_rate": sum(ls) / len(ls),
+            "total_episodes": len(self._rew),
         }
 
 
@@ -99,12 +168,12 @@ def main():
     model_path = args.model_path or os.getenv("MODEL_PATH") or "models/policy.zip"
 
     try:
-        env = make_env(
+        train_env = NavTrainEnv(
             grid_size=cfg["grid_size"],
             object_count=cfg["object_count"],
+            step_budget=cfg["step_budget"],
+            cfg=cfg,
         )
-        # SB3 requires a flat Box obs space — wrap the MiniGrid Dict obs
-        train_env = wrap_for_training(env)
     except Exception as exc:
         logging.error(f"failed to initialize environment: {exc}")
         sys.exit(1)
@@ -128,10 +197,7 @@ def main():
 
     callback = LoggingCallback()
     try:
-        policy.learn(
-            total_timesteps=cfg["total_timesteps"],
-            callback=callback,
-        )
+        policy.learn(total_timesteps=cfg["total_timesteps"], callback=callback)
     except Exception as exc:
         logging.error(f"training failed: {exc}")
         sys.exit(1)

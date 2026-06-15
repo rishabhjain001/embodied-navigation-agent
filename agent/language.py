@@ -20,6 +20,25 @@ SYSTEM_PROMPT = (
 
 _GOAL_KEYS = ("target", "attribute", "context", "error")
 
+# Known colors for the keyword fallback parser
+_COLORS = ("red", "green", "blue", "purple", "yellow", "grey", "gray")
+
+
+def keyword_parse(instruction: str, object_types: frozenset[str]) -> dict:
+    """Simple keyword matcher used as a fallback when the Gemini API is unavailable.
+
+    Scans the instruction for a known object type and optional color so the
+    system stays usable without a live API call (e.g. during rate limits).
+    """
+    text = instruction.lower()
+    target = next((obj for obj in object_types if obj in text), None)
+    if target is None:
+        return _error_goal(f"unrecognized_target:{instruction[:30]}")
+    attribute = next((c for c in _COLORS if c in text), None)
+    if attribute == "gray":
+        attribute = "grey"
+    return {"target": target, "attribute": attribute, "context": None, "error": None}
+
 
 def _sanitize(text: str) -> str:
     return "".join(c for c in text if unicodedata.category(c) != "Cc")
@@ -47,7 +66,6 @@ def parse_instruction(instruction: str, object_types: frozenset[str]) -> dict:
     except (google.api_core.exceptions.DeadlineExceeded, concurrent.futures.TimeoutError):
         return _error_goal("timeout")
     except google.api_core.exceptions.GoogleAPICallError as exc:
-        # grpc status codes map to HTTP-like codes; fall back to 0 if unavailable
         status_code = getattr(exc, "code", None)
         if status_code is None:
             status_code = getattr(exc, "http_status", 0)
